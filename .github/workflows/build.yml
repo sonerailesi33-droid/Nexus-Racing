@@ -1,0 +1,452 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Proje dosyalarini olustur
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          M=app/src/main; P=$M/java/ai/sinyal
+          mkdir -p $P $M/res/values $M/res/xml
+          cat > settings.gradle.kts <<'E'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SinyalAI"
+          include(":app")
+          E
+          cat > build.gradle.kts <<'E'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          E
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx3g\n' > gradle.properties
+          cat > app/build.gradle.kts <<'E'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "ai.sinyal"
+              compileSdk = 35
+              defaultConfig { applicationId = "ai.sinyal"; minSdk = 28; targetSdk = 35; versionCode = 1; versionName = "0.1" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging { jniLibs { useLegacyPackaging = true } }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+              implementation("com.google.mediapipe:tasks-genai:0.10.24")
+          }
+          E
+          cat > $M/AndroidManifest.xml <<'E'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries>
+              <application android:label="Sinyal AI" android:theme="@style/Theme.Sinyal">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+                      <intent-filter><action android:name="android.intent.action.ASSIST"/><category android:name="android.intent.category.DEFAULT"/></intent-filter>
+                      <intent-filter><action android:name="android.intent.action.VOICE_COMMAND"/><category android:name="android.intent.category.DEFAULT"/></intent-filter>
+                  </activity>
+                  <service android:name=".AssistService" android:exported="true" android:permission="android.permission.BIND_VOICE_INTERACTION">
+                      <meta-data android:name="android.voice_interaction" android:resource="@xml/voice_interaction"/>
+                      <intent-filter><action android:name="android.service.voice.VoiceInteractionService"/></intent-filter>
+                  </service>
+                  <service android:name=".AssistSessionService" android:exported="true" android:permission="android.permission.BIND_VOICE_INTERACTION"/>
+                  <service android:name=".SignalAccessibility" android:exported="true" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility"/>
+                  </service>
+              </application>
+          </manifest>
+          E
+          cat > $M/res/values/themes.xml <<'E'
+          <resources><style name="Theme.Sinyal" parent="android:Theme.Material.NoActionBar"><item name="android:windowBackground">#0B0F17</item><item name="android:statusBarColor">#0B0F17</item><item name="android:navigationBarColor">#0B0F17</item></style></resources>
+          E
+          cat > $M/res/values/strings.xml <<'E'
+          <resources><string name="a11y">Sinyal AI ekran goruntusu alma icin kullanir.</string></resources>
+          E
+          cat > $M/res/xml/voice_interaction.xml <<'E'
+          <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:sessionService="ai.sinyal.AssistSessionService" android:recognitionService="ai.sinyal.AssistSessionService" android:supportsAssist="true"/>
+          E
+          cat > $M/res/xml/accessibility.xml <<'E'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged" android:canTakeScreenshot="true"
+              android:accessibilityFlags="flagDefault" android:description="@string/a11y" android:accessibilityFeedbackType="feedbackGeneric"/>
+          E
+          cat > $P/Assist.kt <<'E'
+          package ai.sinyal
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.service.voice.*
+          import android.view.accessibility.AccessibilityEvent
+
+          class AssistService : VoiceInteractionService()
+          class AssistSessionService : VoiceInteractionSessionService() {
+              override fun onNewSession(args: Bundle?) = object : VoiceInteractionSession(this) {
+                  override fun onShow(a: Bundle?, f: Int) {
+                      startAssistantActivity(Intent(this@AssistSessionService, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("voice", true))
+                      hide()
+                  }
+              }
+          }
+          class SignalAccessibility : AccessibilityService() {
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(i: Intent?): Boolean { instance = null; return super.onUnbind(i) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              companion object { var instance: SignalAccessibility? = null }
+          }
+          E
+          cat > $P/Tools.kt <<'E'
+          package ai.sinyal
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.content.Intent
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import org.json.JSONObject
+
+          data class Tool(val name: String, val desc: String, val params: String)
+          class Tools(private val c: Context) {
+              val list = listOf(
+                  Tool("open_app", "Telefondaki bir uygulamayi adiyla acar", """{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"""),
+                  Tool("flashlight", "Feneri acar veya kapatir", """{"type":"object","properties":{"on":{"type":"boolean"}},"required":["on"]}"""),
+                  Tool("set_volume", "Medya ses seviyesini 0-100 yuzde olarak ayarlar", """{"type":"object","properties":{"percent":{"type":"integer"}},"required":["percent"]}"""),
+                  Tool("screenshot", "Ekran goruntusu alir", """{"type":"object","properties":{}}"""),
+                  Tool("remember", "Kullanici hakkinda kalici bir bilgiyi yerel hafizaya kaydeder", """{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}""")
+              )
+              fun run(name: String, a: JSONObject): String = try {
+                  when (name) {
+                      "open_app" -> {
+                          val pm = c.packageManager
+                          val q = a.getString("name").lowercase()
+                          val app = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                              .firstOrNull { it.loadLabel(pm).toString().lowercase().contains(q) }
+                          if (app == null) "Uygulama bulunamadi: $q" else {
+                              c.startActivity(pm.getLaunchIntentForPackage(app.activityInfo.packageName)!!.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                              "Acildi: ${app.loadLabel(pm)}"
+                          }
+                      }
+                      "flashlight" -> {
+                          val cm = c.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                          val id = cm.cameraIdList.first { cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true }
+                          cm.setTorchMode(id, a.getBoolean("on")); "Fener ${if (a.getBoolean("on")) "acildi" else "kapandi"}"
+                      }
+                      "set_volume" -> {
+                          val am = c.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                          val p = a.getInt("percent").coerceIn(0, 100)
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, max * p / 100, AudioManager.FLAG_SHOW_UI); "Ses %$p yapildi"
+                      }
+                      "screenshot" -> {
+                          val s = SignalAccessibility.instance
+                          if (s == null) "Erisilebilirlik servisi kapali. Ayarlar > Erisilebilirlik > Sinyal AI'yi ac."
+                          else { s.performGlobalAction(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT); "Ekran goruntusu alindi" }
+                      }
+                      "remember" -> { Store(c).addMemory(a.getString("fact")); "Kaydedildi" }
+                      else -> "Bilinmeyen arac: $name"
+                  }
+              } catch (e: Exception) { "Hata: ${e.message}" }
+          }
+          E
+          cat > $P/Store.kt <<'E'
+          package ai.sinyal
+          import android.content.Context
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class Store(c: Context) {
+              private val secure = EncryptedSharedPreferences.create(c, "secure", MasterKey.Builder(c).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV, EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
+              private val p = c.getSharedPreferences("data", Context.MODE_PRIVATE)
+              var groqKey: String
+                  get() = secure.getString("groq", "") ?: ""
+                  set(v) { secure.edit().putString("groq", v).apply() }
+              var mode: String
+                  get() = p.getString("mode", "auto")!!
+                  set(v) { p.edit().putString("mode", v).apply() }
+              var speak: Boolean
+                  get() = p.getBoolean("speak", true)
+                  set(v) { p.edit().putBoolean("speak", v).apply() }
+              fun memories(): List<String> = JSONArray(p.getString("mem", "[]")).let { a -> List(a.length()) { a.getString(it) } }
+              fun addMemory(f: String) { val a = JSONArray(p.getString("mem", "[]")); a.put(f); p.edit().putString("mem", a.toString()).apply() }
+              fun history(): List<Pair<String, String>> = JSONArray(p.getString("hist", "[]")).let { a -> List(a.length()) { a.getJSONObject(it).let { o -> o.getString("r") to o.getString("t") } } }
+              fun saveHistory(h: List<Pair<String, String>>) {
+                  val a = JSONArray(); h.takeLast(200).forEach { a.put(JSONObject().put("r", it.first).put("t", it.second)) }
+                  p.edit().putString("hist", a.toString()).apply()
+              }
+              fun clearHistory() { p.edit().remove("hist").apply() }
+          }
+          E
+          cat > $P/Ai.kt <<'E'
+          package ai.sinyal
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import com.google.mediapipe.tasks.genai.llminference.LlmInference
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.util.concurrent.TimeUnit
+
+          data class Call(val id: String, val name: String, val args: JSONObject)
+          data class Msg(val role: String, val text: String = "", val calls: List<Call> = emptyList(), val callId: String = "")
+          data class Reply(val text: String, val calls: List<Call>)
+          interface Engine { suspend fun chat(msgs: List<Msg>, tools: List<Tool>): Reply }
+
+          class GroqEngine(private val key: String) : Engine {
+              private val http = OkHttpClient.Builder().callTimeout(60, TimeUnit.SECONDS).build()
+              override suspend fun chat(msgs: List<Msg>, tools: List<Tool>): Reply = withContext(Dispatchers.IO) {
+                  val m = JSONArray()
+                  msgs.forEach { x ->
+                      val o = JSONObject().put("role", x.role)
+                      when {
+                          x.role == "tool" -> o.put("tool_call_id", x.callId).put("content", x.text)
+                          x.calls.isNotEmpty() -> {
+                              o.put("content", JSONObject.NULL)
+                              o.put("tool_calls", JSONArray(x.calls.map {
+                                  JSONObject().put("id", it.id).put("type", "function")
+                                      .put("function", JSONObject().put("name", it.name).put("arguments", it.args.toString()))
+                              }))
+                          }
+                          else -> o.put("content", x.text)
+                      }
+                      m.put(o)
+                  }
+                  val t = JSONArray(tools.map {
+                      JSONObject().put("type", "function").put("function",
+                          JSONObject().put("name", it.name).put("description", it.desc).put("parameters", JSONObject(it.params)))
+                  })
+                  val body = JSONObject().put("model", "openai/gpt-oss-20b").put("messages", m).put("tools", t).toString()
+                  val req = Request.Builder().url("https://api.groq.com/openai/v1/chat/completions").header("Authorization", "Bearer $key")
+                      .post(body.toRequestBody("application/json".toMediaType())).build()
+                  http.newCall(req).execute().use { r ->
+                      val s = r.body?.string() ?: ""
+                      if (!r.isSuccessful) error("Groq ${r.code}: ${s.take(200)}")
+                      val msg = JSONObject(s).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+                      val tc = msg.optJSONArray("tool_calls")
+                      Reply(msg.optString("content", ""), if (tc == null) emptyList() else List(tc.length()) {
+                          val f = tc.getJSONObject(it); val fn = f.getJSONObject("function")
+                          Call(f.getString("id"), fn.getString("name"), JSONObject(fn.optString("arguments", "{}").ifBlank { "{}" }))
+                      })
+                  }
+              }
+          }
+
+          class LocalEngine(private val c: Context) : Engine {
+              companion object {
+                  fun modelFile(c: Context) = File(c.filesDir, "qwen.task")
+                  private var llm: LlmInference? = null
+              }
+              override suspend fun chat(msgs: List<Msg>, tools: List<Tool>): Reply = withContext(Dispatchers.Default) {
+                  val f = modelFile(c)
+                  if (!f.exists()) error("Yerel model yuklenmemis. Ayarlar'dan Qwen .task dosyasini sec.")
+                  if (llm == null) llm = LlmInference.createFromOptions(c,
+                      LlmInference.LlmInferenceOptions.builder().setModelPath(f.path).setMaxTokens(1024).build())
+                  val sys = "Sen Sinyal AI'sin, kisa Turkce cevap ver. Arac gerekirse SADECE su JSON ile cevap ver: {\"tool\":\"ad\",\"args\":{...}}. Araclar:\n" +
+                      tools.joinToString("\n") { "- ${it.name}: ${it.desc} parametreler=${it.params}" }
+                  val sb = StringBuilder("<|im_start|>system\n$sys<|im_end|>\n")
+                  msgs.filter { it.role != "system" }.forEach { x ->
+                      when {
+                          x.role == "tool" -> sb.append("<|im_start|>user\n[arac sonucu] ${x.text}<|im_end|>\n")
+                          x.calls.isNotEmpty() -> sb.append("<|im_start|>assistant\n{\"tool\":\"${x.calls[0].name}\",\"args\":${x.calls[0].args}}<|im_end|>\n")
+                          else -> sb.append("<|im_start|>${x.role}\n${x.text}<|im_end|>\n")
+                      }
+                  }
+                  sb.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+                  val out = llm!!.generateResponse(sb.toString()).replace(Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL), "").trim()
+                  val j = Regex("\\{.*\\}", RegexOption.DOT_MATCHES_ALL).find(out)?.value
+                  val call = try { j?.let { JSONObject(it) }?.takeIf { it.has("tool") } } catch (e: Exception) { null }
+                  if (call != null) Reply("", listOf(Call("local${System.nanoTime()}", call.getString("tool"), call.optJSONObject("args") ?: JSONObject())))
+                  else Reply(out, emptyList())
+              }
+          }
+
+          class Agent(private val c: Context, private val store: Store) {
+              private val tools = Tools(c)
+              private fun online(): Boolean {
+                  val cm = c.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                  return cm.getNetworkCapabilities(cm.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+              }
+              private fun engine(): Engine {
+                  val cloud = store.mode == "cloud" || (store.mode == "auto" && online())
+                  return if (cloud && store.groqKey.isNotBlank()) GroqEngine(store.groqKey) else LocalEngine(c)
+              }
+              suspend fun ask(history: List<Pair<String, String>>): String {
+                  val e = engine()
+                  val mem = store.memories().joinToString("; ")
+                  val msgs = mutableListOf(Msg("system", "Sen Sinyal AI'sin, Android asistani. Turkce, kisa yanit ver. Telefon islemleri icin araclari kullan. Kullanici hakkinda bilinenler: $mem"))
+                  history.takeLast(12).forEach { msgs += Msg(it.first, it.second) }
+                  repeat(4) {
+                      val r = e.chat(msgs, tools.list)
+                      if (r.calls.isEmpty()) return r.text.ifBlank { "Tamam." }
+                      msgs += Msg("assistant", calls = r.calls)
+                      r.calls.forEach { msgs += Msg("tool", tools.run(it.name, it.args), callId = it.id) }
+                  }
+                  return "Islem tamamlandi."
+              }
+          }
+          E
+          cat > $P/MainActivity.kt <<'E'
+          package ai.sinyal
+          import android.Manifest
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognizerIntent
+          import android.speech.tts.TextToSpeech
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+              private var tts: TextToSpeech? = null
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  tts = TextToSpeech(this) { tts?.language = Locale("tr", "TR") }
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF4CC9F0), background = Color(0xFF0B0F17), surface = Color(0xFF151B27))) {
+                          Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { Chat() }
+                      }
+                  }
+              }
+              override fun onDestroy() { tts?.shutdown(); super.onDestroy() }
+
+              @OptIn(ExperimentalMaterial3Api::class)
+              @Composable fun Chat() {
+                  val ctx = LocalContext.current
+                  val store = remember { Store(ctx) }
+                  val agent = remember { Agent(ctx, store) }
+                  val scope = rememberCoroutineScope()
+                  val msgs = remember { mutableStateListOf<Pair<String, String>>().apply { addAll(store.history()) } }
+                  var input by remember { mutableStateOf("") }
+                  var busy by remember { mutableStateOf(false) }
+                  var settings by remember { mutableStateOf(false) }
+                  var key by remember { mutableStateOf(store.groqKey) }
+                  var mode by remember { mutableStateOf(store.mode) }
+
+                  fun send(t: String) {
+                      if (t.isBlank() || busy) return
+                      msgs.add("user" to t); input = ""; busy = true
+                      scope.launch {
+                          val a = try { agent.ask(msgs.toList()) } catch (e: Exception) { "Hata: ${e.message}" }
+                          msgs.add("assistant" to a); store.saveHistory(msgs); busy = false
+                          if (store.speak) tts?.speak(a, TextToSpeech.QUEUE_FLUSH, null, "r")
+                      }
+                  }
+                  val mic = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                      r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { send(it) }
+                  }
+                  val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      if (ok) mic.launch(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR"))
+                  }
+                  val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u ->
+                      u?.let { scope.launch(Dispatchers.IO) {
+                          ctx.contentResolver.openInputStream(it)?.use { i -> LocalEngine.modelFile(ctx).outputStream().use { o -> i.copyTo(o) } }
+                      } }
+                  }
+                  LaunchedEffect(Unit) { if (intent?.getBooleanExtra("voice", false) == true) perm.launch(Manifest.permission.RECORD_AUDIO) }
+
+                  Column(Modifier.fillMaxSize().systemBarsPadding().padding(12.dp)) {
+                      Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          Text("Sinyal AI", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                          TextButton(onClick = { settings = !settings }) { Text(if (settings) "Sohbet" else "Ayarlar") }
+                      }
+                      if (settings) Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedTextField(key, { key = it; store.groqKey = it }, label = { Text("Groq API anahtari") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              listOf("auto" to "Otomatik", "cloud" to "Groq", "local" to "Yerel").forEach { (k, l) ->
+                                  FilterChip(mode == k, { mode = k; store.mode = k }, { Text(l) })
+                              }
+                          }
+                          Button(onClick = { pick.launch(arrayOf("*/*")) }) { Text("Qwen 0.6B model dosyasini sec (.task)") }
+                          Button(onClick = { startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)) }) { Text("Varsayilan asistan olarak ayarla") }
+                          Button(onClick = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) { Text("Erisilebilirligi ac (ekran goruntusu)") }
+                          Button(onClick = { msgs.clear(); store.clearHistory() }) { Text("Gecmisi temizle") }
+                      } else {
+                          LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              items(msgs) { (r, t) ->
+                                  Box(Modifier.fillMaxWidth(), contentAlignment = if (r == "user") Alignment.CenterEnd else Alignment.CenterStart) {
+                                      Text(t, Modifier.background(if (r == "user") Color(0xFF1B4965) else Color(0xFF151B27), RoundedCornerShape(14.dp)).padding(12.dp))
+                                  }
+                              }
+                              if (busy) item { Text("Dusunuyor...", color = Color.Gray) }
+                          }
+                          Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                              OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("Bir sey soyle...") })
+                              TextButton(onClick = { perm.launch(Manifest.permission.RECORD_AUDIO) }) { Text("Mik") }
+                              Button(onClick = { send(input) }) { Text("Gonder") }
+                          }
+                      }
+                  }
+              }
+          }
+          E
+
+      - name: Derle
+        working-directory: proj
+        run: gradle :app:assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SinyalAI-debug-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
